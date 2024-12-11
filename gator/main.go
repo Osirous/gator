@@ -16,7 +16,6 @@ import (
 	"github.com/Osirous/gator/internal/database"
 	"github.com/google/uuid"
 	"github.com/lib/pq"
-	_ "github.com/lib/pq"
 )
 
 type state struct {
@@ -73,7 +72,11 @@ func main() {
 	cmds.register("reset", handlerReset)
 	cmds.register("users", handlerGetUsers)
 	cmds.register("agg", handlerAgg)
-	cmds.register("addfeed", handlerFeed)
+	cmds.register("addfeed", middlewareLoggedIn(handlerFeed))
+	cmds.register("feeds", handlerListFeeds)
+	cmds.register("follow", middlewareLoggedIn(handlerFollow))
+	cmds.register("following", middlewareLoggedIn(handlerFollowing))
+	cmds.register("unfollow", middlewareLoggedIn(handlerUnfollow))
 
 	if len(os.Args) < 2 {
 		log.Fatal("not enough arugments")
@@ -91,27 +94,130 @@ func main() {
 
 }
 
-func handlerFeed(s *state, cmd command) error {
+// scrapeGoat - its eating all the feeds!
+func scrapeFeeds(s *state) error {
+
+	feed, err := s.db.GetNextFeedToFetch(context.Background())
+	if err != nil {
+		return fmt.Errorf("unable to get next feed to fetch: %v", err)
+	}
+
+	err = s.db.MarkFeedFetched(context.Background(), feed.ID)
+	if err != nil {
+		return fmt.Errorf("error marking feed as fetched: %v", err)
+	}
+
+	rssFeed, err := fetchFeed(context.Background(), feed.Url)
+	if err != nil {
+		return fmt.Errorf("error fetching feed: %v", err)
+	}
+
+	for _, item := range rssFeed.Channel.Item {
+		fmt.Println(item.Title)
+	}
+	return nil
+}
+
+func middlewareLoggedIn(handler func(s *state, cmd command, user database.User) error) func(*state, command) error {
+	return func(s *state, cmd command) error {
+		user, err := s.db.GetUser(context.Background(), s.config.CurrentUserName)
+		if err != nil {
+			return fmt.Errorf("unable to retrieve current user: %v", err)
+		}
+		return handler(s, cmd, user)
+	}
+}
+
+func handlerUnfollow(s *state, cmd command, user database.User) error {
+	//[DEBUG] fmt.Printf("Number of arguments: %d, Arguments: %v\n", len(cmd.args), cmd.args)
+	if len(cmd.args) != 1 {
+		return fmt.Errorf("unfollow command requires exactly one argument: the feed URL")
+	}
+
+	err := s.db.DeleteFeedFollow(context.Background(), database.DeleteFeedFollowParams{
+		UserID: uuid.NullUUID{UUID: user.ID, Valid: true},
+		Url:    cmd.args[0],
+	})
+	if err != nil {
+		//[DEBUG] fmt.Printf("SQL Error: %v\n", err)
+		return fmt.Errorf("error unfollowing feed: %v", err)
+	}
+	return nil
+}
+
+func handlerFeed(s *state, cmd command, user database.User) error {
 	if len(cmd.args) < 2 {
 		return fmt.Errorf("please provide both a name and a URL to continue")
 	}
 
-	user, err := s.db.GetUser(context.Background(), s.config.CurrentUserName)
+	//[DEBUG] fmt.Println("Attempting to add feed...") // Add this for debugging
+	err := addFeed(s, user, cmd.args[0], cmd.args[1])
 	if err != nil {
-		return fmt.Errorf("unable to retreive current user: %v", err)
+		return fmt.Errorf("unable to add new feed: %v", err)
 	}
 
-	return addFeed(s, user.ID, cmd.args[0], cmd.args[1])
+	//[DEBUG] fmt.Println("Attempting to add follow...") // Add this for debugging
+	err = addfollow(s, cmd.args[1], user)
+	if err != nil {
+		return fmt.Errorf("unable to add new follow: %v", err)
+	}
+
+	return nil
 }
 
-func addFeed(s *state, userID uuid.UUID, name string, url string) error {
+func handlerFollowing(s *state, cmd command, user database.User) error {
+	follows, err := s.db.GetFeedFollowsByUser(context.Background(), uuid.NullUUID{UUID: user.ID, Valid: true})
+	if err != nil {
+		return fmt.Errorf("error retrieving feed follows: %v", err)
+	}
+
+	for _, follow := range follows {
+		fmt.Printf("%v\n", follow.FeedName)
+	}
+
+	return nil
+}
+
+func handlerFollow(s *state, cmd command, user database.User) error {
+	if len(cmd.args) != 1 {
+		return fmt.Errorf("follow command requires exactly one argument: the feed URL")
+	}
+
+	url := cmd.args[0]
+	return addfollow(s, url, user)
+}
+
+func addfollow(s *state, url string, user database.User) error {
+	feed, err := s.db.GetFeedByUrl(context.Background(), url)
+	if err != nil {
+		return fmt.Errorf("error retrieving feed from the database: %v", err)
+	}
+
+	feedParams := database.CreateFeedFollowParams{
+		ID:        uuid.New(),
+		CreatedAt: time.Now(),
+		UpdatedAt: time.Now(),
+		UserID:    uuid.NullUUID{UUID: user.ID, Valid: true},
+		FeedID:    uuid.NullUUID{UUID: feed.ID, Valid: true},
+	}
+
+	followResult, err := s.db.CreateFeedFollow(context.Background(), feedParams)
+	if err != nil {
+		return fmt.Errorf("error creating feed follow: %v", err)
+	}
+
+	fmt.Printf("You are now following '%v'\n", followResult.FeedName)
+	return nil
+}
+
+func addFeed(s *state, user database.User, name string, url string) error {
 	feedParams := database.CreateFeedParams{
 		ID:        uuid.New(),
 		CreatedAt: time.Now(),
 		UpdatedAt: time.Now(),
 		Name:      name,
 		Url:       url,
-		UserID:    uuid.NullUUID{UUID: userID, Valid: true},
+		UserID:    uuid.NullUUID{UUID: user.ID, Valid: true},
 	}
 
 	_, err := s.db.CreateFeed(context.Background(), feedParams)
@@ -124,15 +230,35 @@ func addFeed(s *state, userID uuid.UUID, name string, url string) error {
 	return nil
 }
 
-func handlerAgg(s *state, cmd command) error {
-	ctx := context.Background()
-	feed, err := fetchFeed(ctx, "https://www.wagslane.dev/index.xml")
+func handlerListFeeds(s *state, cmd command) error {
+	feeds, err := s.db.GetFeeds(context.Background())
 	if err != nil {
-		return err
+		return fmt.Errorf("error retrieving all of the feeds from the database: %v", err)
 	}
 
-	fmt.Printf("%+v\n", feed)
+	fmt.Printf("* %v\n", feeds)
+
 	return nil
+}
+
+func handlerAgg(s *state, cmd command) error {
+	//[DEBUG] fmt.Printf("Number of arguments: %d, Arguments: %v\n", len(cmd.args), cmd.args)
+	if len(cmd.args) < 1 {
+		return fmt.Errorf("missing required argument: Time between requests")
+	}
+
+	timeBetweenReqs := cmd.args[0]
+	duration, err := time.ParseDuration(timeBetweenReqs)
+	if err != nil {
+		return fmt.Errorf("invalid duration format: %v", err)
+	}
+
+	fmt.Printf("Collecting feeds every %v\n", duration)
+
+	ticker := time.NewTicker(duration)
+	for ; ; <-ticker.C {
+		scrapeFeeds(s)
+	}
 }
 
 func fetchFeed(ctx context.Context, feedURL string) (*RSSFeed, error) {
@@ -177,7 +303,7 @@ func fetchFeed(ctx context.Context, feedURL string) (*RSSFeed, error) {
 func handlerGetUsers(s *state, cmd command) error {
 	users, err := s.db.GetUsers(context.Background())
 	if err != nil {
-		return fmt.Errorf("error retreiving all of the users from the database: %v", err)
+		return fmt.Errorf("error retrieving all of the users from the database: %v", err)
 	}
 
 	for _, user := range users {
