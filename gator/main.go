@@ -9,7 +9,9 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
+	"strconv"
 	"time"
 
 	"github.com/Osirous/gator/internal/config"
@@ -72,6 +74,7 @@ func main() {
 	cmds.register("reset", handlerReset)
 	cmds.register("users", handlerGetUsers)
 	cmds.register("agg", handlerAgg)
+	cmds.register("browse", middlewareLoggedIn(handlerBrowse))
 	cmds.register("addfeed", middlewareLoggedIn(handlerFeed))
 	cmds.register("feeds", handlerListFeeds)
 	cmds.register("follow", middlewareLoggedIn(handlerFollow))
@@ -94,6 +97,50 @@ func main() {
 
 }
 
+func parseStringToInt32(s string) (int32, error) {
+	i64, err := strconv.ParseInt(s, 10, 32) // Base 10, 32-bit size
+	if err != nil {
+		if _, ok := err.(*strconv.NumError); ok {
+			// Handle the specific case where the input is non-numeric
+			fmt.Println("Input is not a number, use a number next time. Defaulting to limit of 1.")
+			// Return 1 as the default
+			return 1, nil
+		}
+		// For other errors not related to parsing as a number, return the error
+		return 0, err
+	}
+	// Safely cast the int64 result to int32
+	return int32(i64), nil
+}
+
+func handlerBrowse(s *state, cmd command, user database.User) error {
+	//[DEBUG] fmt.Printf("Number of arguments: %d, Arguments: %v\n", len(cmd.args), cmd.args)
+	defaultLimit := int32(2) // Default limit if not provided
+	var limitTotal int32
+
+	if len(cmd.args) < 1 {
+		// Use default limit if no argument is provided
+		limitTotal = defaultLimit
+	} else {
+		// Parse cmd.args from a string to an int
+		parsedLimit, err := parseStringToInt32(cmd.args[0])
+		if err != nil {
+			return err
+		}
+		limitTotal = parsedLimit
+	}
+
+	posts, err := s.db.GetPostsByUser(context.Background(), database.GetPostsByUserParams{
+		UserID: uuid.NullUUID{UUID: user.ID, Valid: true},
+		Limit:  limitTotal,
+	})
+	if err != nil {
+		return err
+	}
+	fmt.Printf("%v\n", posts)
+	return nil
+}
+
 // scrapeGoat - its eating all the feeds!
 func scrapeFeeds(s *state) error {
 
@@ -113,9 +160,56 @@ func scrapeFeeds(s *state) error {
 	}
 
 	for _, item := range rssFeed.Channel.Item {
-		fmt.Println(item.Title)
+
+		parsedPublishTime, err := parsePubDate(item.PubDate)
+		if err != nil {
+			log.Printf("unable to get a time for when the post was published: %v", err)
+			continue
+		}
+
+		postParams := database.CreatePostParams{
+			ID:          uuid.New(),
+			Title:       item.Title,
+			Url:         item.Link,
+			Description: stringToNullString(item.Description),
+			PublishedAt: parsedPublishTime,
+			FeedID:      uuid.NullUUID{UUID: feed.ID, Valid: true},
+		}
+
+		_, err = s.db.CreatePost(context.Background(), postParams)
+		if err != nil {
+			if pqErr, ok := err.(*pq.Error); ok && pqErr.Code == "23505" {
+				// Handle duplicate URL error: ignore it
+				continue
+			}
+			log.Printf("unable to create post: %v", err)
+			continue
+		}
+
 	}
 	return nil
+}
+
+// A function to parse the PubDate from the RSS item
+func parsePubDate(pubDate string) (time.Time, error) {
+	// Define layout for the expected date format
+	layout := "Mon, 02 Jan 2006 15:04:05 MST"
+
+	// Attempt to parse using the layout
+	parsedTime, err := time.Parse(layout, pubDate)
+	if err != nil {
+		return time.Time{}, err // Handle the error
+	}
+
+	return parsedTime, nil
+}
+
+// Convert string to NullString
+func stringToNullString(s string) sql.NullString {
+	if s == "" {
+		return sql.NullString{String: "", Valid: false}
+	}
+	return sql.NullString{String: s, Valid: true}
 }
 
 func middlewareLoggedIn(handler func(s *state, cmd command, user database.User) error) func(*state, command) error {
@@ -210,7 +304,16 @@ func addfollow(s *state, url string, user database.User) error {
 	return nil
 }
 
+func isValidURL(u string) bool {
+	_, err := url.ParseRequestURI(u)
+	return err == nil
+}
+
 func addFeed(s *state, user database.User, name string, url string) error {
+	if !isValidURL(url) {
+		return fmt.Errorf("invalid URL format: %s", url)
+	}
+
 	feedParams := database.CreateFeedParams{
 		ID:        uuid.New(),
 		CreatedAt: time.Now(),
