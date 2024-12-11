@@ -71,7 +71,7 @@ func main() {
 	cmds := &commands{}
 	cmds.register("login", handlerLogin)
 	cmds.register("register", handlerRegister)
-	cmds.register("reset", handlerReset)
+	//cmds.register("reset", handlerReset)
 	cmds.register("users", handlerGetUsers)
 	cmds.register("agg", handlerAgg)
 	cmds.register("browse", middlewareLoggedIn(handlerBrowse))
@@ -419,6 +419,7 @@ func handlerGetUsers(s *state, cmd command) error {
 	return nil
 }
 
+/*
 func handlerReset(s *state, cmd command) error {
 	err := s.db.Reset(context.Background())
 	if err != nil {
@@ -426,6 +427,7 @@ func handlerReset(s *state, cmd command) error {
 	}
 	return nil
 }
+*/
 
 func handlerRegister(s *state, cmd command) error {
 	if len(cmd.args) < 1 {
